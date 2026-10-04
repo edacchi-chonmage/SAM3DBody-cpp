@@ -57,6 +57,12 @@ HF_REPO="AmmarkoV/SAM3DBody-cpp-onnx-models"
 HF_REVISION="${SAM3D_HF_REVISION:-main}"
 
 ONNX_DIR="${REPO_ROOT}/onnx"
+
+# GNU stat uses -c '%s'; BSD/macOS stat uses -f '%z'.
+_fsize() { stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1" 2>/dev/null || echo 0; }
+# sha256sum is GNU coreutils; macOS ships shasum instead.
+_sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+
 PROFILES=()
 LIST_ONLY=0
 FORCE=0
@@ -205,7 +211,7 @@ for entry in "${MANIFEST[@]}"; do
         # actually happens (a truncated download).  Full sha256 over 3.4 GB on
         # every startup would cost more than it buys, so it is only verified
         # for files this script downloads itself.
-        actual=$(stat -c '%s' "${ONNX_DIR}/${name}" 2>/dev/null || echo 0)
+        actual=$(_fsize "${ONNX_DIR}/${name}")
         if [[ "$actual" == "$size" ]]; then
             continue
         fi
@@ -265,25 +271,25 @@ for i in "${!NEED_NAMES[@]}"; do
     # Resume only when a partial exists and is shorter than the target; a .part
     # already at full size would make curl request an unsatisfiable range (416)
     # and --fail would turn that into an error.
-    have=$( [[ -f "$part" ]] && stat -c '%s' "$part" 2>/dev/null || echo 0 )
+    have=$( [[ -f "$part" ]] && _fsize "$part" || echo 0 )
     if [[ "$have" -lt "$size" ]]; then
         resume=()
         [[ "$have" -gt 0 ]] && resume=(--continue-at -)
         curl -L --fail --progress-bar --retry 3 --retry-delay 2 \
-             "${CURL_AUTH[@]}" ${resume[@]+"${resume[@]}"} -o "$part" "$url"
+             ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} ${resume[@]+"${resume[@]}"} -o "$part" "$url"
     else
         echo "        complete partial found — verifying."
     fi
 
-    actual=$(stat -c '%s' "$part" 2>/dev/null || echo 0)
+    actual=$(_fsize "$part")
     if [[ "$actual" != "$size" ]]; then
         echo "  ERROR: ${name} is $(_human "$actual"), expected $(_human "$size")." >&2
         echo "         Partial kept at ${part} — rerun to resume." >&2
         exit 1
     fi
 
-    if command -v sha256sum >/dev/null 2>&1; then
-        got=$(sha256sum "$part" | cut -d' ' -f1)
+    if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then
+        got=$(_sha256 "$part")
         if [[ "$got" != "$sha" ]]; then
             echo "  ERROR: ${name} sha256 mismatch." >&2
             echo "         expected ${sha}" >&2
