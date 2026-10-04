@@ -2,8 +2,13 @@ project( AmMatrix )
 cmake_minimum_required( VERSION 3.18 )
  
 #Make fast, lean and platform independent binaries..
-set(CMAKE_CXX_FLAGS "-s -O3 -fPIC -march=native -mtune=native")
-set(CMAKE_C_FLAGS "-s -O3 -fPIC -march=native -mtune=native") 
+if(APPLE)
+set(_AM_STRIP "")   # -s is not accepted by Apple ld
+else()
+set(_AM_STRIP "-s ")
+endif()
+set(CMAKE_CXX_FLAGS "${_AM_STRIP}-O3 -fPIC -march=native -mtune=native")
+set(CMAKE_C_FLAGS "${_AM_STRIP}-O3 -fPIC -march=native -mtune=native") 
 
 OPTION(INTEL_OPTIMIZATIONS OFF)
 
@@ -30,7 +35,11 @@ add_library(
             simpleRenderer.c
             solids.c
            )
+if(APPLE)
+target_link_libraries(AmMatrix m)
+else()
 target_link_libraries(AmMatrix m rt )
+endif()
 
 set_target_properties(AmMatrix PROPERTIES
                        DEBUG_POSTFIX "D"

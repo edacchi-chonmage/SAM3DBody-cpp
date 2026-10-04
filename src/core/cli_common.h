@@ -62,6 +62,9 @@
 #include <string>
 #include <vector>     // ensure_models(): sentinel file list
 #include <glob.h>     // resolve_detector_defaults(): find libreyolo*.onnx in onnx_dir
+#ifdef __APPLE__
+#include <mach-o/dyld.h>  // _NSGetExecutablePath (no /proc/self/exe on macOS)
+#endif
 #include <unistd.h>   // ensure_trt_models(): readlink("/proc/self/exe") to locate setup_trt.sh
 
 #include "fast_sam_3dbody.h"  // for fsb::PipelineConfig
@@ -83,6 +86,9 @@ struct CommonConfig
     std::string decoder_name   = "decoder.onnx";  // → decoder_fp16.onnx under --trt and on CPU
     int         cuda_device    = 0;       // -1 = CPU
     bool        use_trt        = false;
+    bool        use_coreml     = false;   // ONNX Runtime CoreML EP (macOS)
+    std::string coreml_units   = "ALL";
+    int         ort_threads    = 1;
     bool        fp16           = true;    // can be disabled with --no-fp16
     bool        ort_verbose    = false;   // --ort-verbose: print per-node EP assignment at session load
     int         pipeline_depth = 1;       // --pipeline N: run N frames concurrently
@@ -162,6 +168,22 @@ struct CommonConfig
 // argv is taken as `const char* const*` so callers can pass either the C
 // `const char **argv` (renderer) or the C++ `char **argv` (main / offline)
 // without explicit casts.
+// Absolute path of the running executable ("" on failure).
+inline std::string self_exe_path()
+{
+    char buf[4096];
+#ifdef __APPLE__
+    uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) == 0) return std::string(buf);
+    return "";
+#else
+    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return "";
+    buf[n] = '\0';
+    return std::string(buf);
+#endif
+}
+
 inline bool parse_common_arg(int argc, const char* const* argv, int& i,
                              CommonConfig& c)
 {
@@ -194,6 +216,10 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_INT ("--start",                start_frame)
     CLI_INT ("--cuda",                 cuda_device)
     CLI_BOOL("--trt",                  use_trt, true)
+    CLI_STR ("--coreml-units",         coreml_units)
+    CLI_INT ("--ort-threads",          ort_threads)
+    if (std::strcmp(argv[i], "--coreml") == 0)
+    { c.use_coreml = true; c.cuda_device = -1; return true; }   // CoreML needs the CPU-format models
     CLI_BOOL("--no-fp16",              fp16,    false)
     CLI_BOOL("--ort-verbose",          ort_verbose, true)
     CLI_INT ("--pipeline",             pipeline_depth)
@@ -399,11 +425,8 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
     // fetch script without depending on the working directory.
     std::string exe_dir;
     {
-        char buf[4096];
-        ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (n > 0) {
-            buf[n] = '\0';
-            std::string exe(buf);
+        std::string exe = self_exe_path();
+        if (!exe.empty()) {
             size_t s = exe.find_last_of('/');
             if (s != std::string::npos) exe_dir = exe.substr(0, s);
         }
@@ -543,11 +566,8 @@ inline void ensure_trt_models(const CommonConfig& c)
     // so ../tools/), with the working dir as a fallback.
     std::string script;
     {
-        char buf[4096];
-        ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (n > 0) {
-            buf[n] = '\0';
-            std::string exe(buf);
+        std::string exe = self_exe_path();
+        if (!exe.empty()) {
             size_t s = exe.find_last_of('/');
             if (s != std::string::npos) {
                 std::string cand = exe.substr(0, s) + "/../tools/setup_trt.sh";
@@ -708,6 +728,9 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
     pc.yolo_path      = c.yolo_path;
     pc.cuda_device    = c.cuda_device;
     pc.use_trt_ep     = c.use_trt;
+    pc.use_coreml     = c.use_coreml;
+    pc.coreml_units   = c.coreml_units;
+    pc.ort_threads    = c.ort_threads;
     pc.use_fp16       = c.fp16;
     pc.ort_verbose    = c.ort_verbose;
     pc.pipeline_depth = c.pipeline_depth;
@@ -747,6 +770,9 @@ inline void print_common_args_help(FILE* fp)
         "  --start    N                   Skip to frame N before processing (seek into the video; default 0)\n"
         "  --cuda     N                   CUDA device (-1 = CPU; default 0)\n"
         "  --trt                          Use ONNX Runtime TensorRT EP\n"
+        "  --coreml                       Use ONNX Runtime CoreML EP (macOS Apple GPU / Neural Engine; implies --cuda -1)\n"
+        "  --coreml-units S               CoreML compute units: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly (default ALL)\n"
+        "  --ort-threads N                ORT intra-op threads per session (default 1; 0 = all cores)\n"
         "  --no-fp16                      Disable FP16\n"
         "  --pipeline N                   Process N frames concurrently on a worker pool (default 1).\n"
         "                                 N=1 is the ordinary synchronous path.  N>1 trades latency for\n"

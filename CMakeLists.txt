@@ -15,6 +15,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(WIN32)
     set(MATH_LIB "")   # libm is folded into the CRT on Windows
     set(RT_LIB   "")   # librt is POSIX-only
+elseif(APPLE)
+    set(MATH_LIB m)
+    set(RT_LIB   "")   # no librt on macOS
 else()
     set(MATH_LIB m)
     set(RT_LIB   rt)
@@ -177,6 +180,7 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
     GIT_PROGRESS   TRUE
 )
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)         # miniz declares cmake_minimum_required < 3.5 (rejected by CMake 4)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)  # miniz's own option name, not ours
 FetchContent_MakeAvailable(miniz)
 
@@ -208,6 +212,9 @@ if(NOT DEFINED ONNX_RUNTIME_DIR OR ONNX_RUNTIME_DIR STREQUAL "")
         if(ONNX_RUNTIME_DIR STREQUAL "" OR NOT DEFINED ONNX_RUNTIME_DIR)
             # Download the pre-built package matching this platform/accelerator.
             set(_ORT_VERSION "1.20.1")
+            if(APPLE)
+                set(_ORT_VERSION "1.30.0")   # official macOS release includes the CoreML EP
+            endif()
             if(WITH_CUDA)
                 set(_ORT_SUFFIX "-gpu")
             else()
@@ -216,6 +223,14 @@ if(NOT DEFINED ONNX_RUNTIME_DIR OR ONNX_RUNTIME_DIR STREQUAL "")
             if(WIN32)
                 set(_ORT_OS  "win-x64")
                 set(_ORT_EXT "zip")
+            elseif(APPLE)
+                if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+                    set(_ORT_OS "osx-x86_64")
+                else()
+                    set(_ORT_OS "osx-arm64")
+                endif()
+                set(_ORT_EXT "tgz")
+                set(_ORT_SUFFIX "")
             else()
                 set(_ORT_OS  "linux-x64")
                 set(_ORT_EXT "tgz")
@@ -398,6 +413,17 @@ target_compile_options(fast_sam_3dbody PRIVATE
 # ---------------------------------------------------------------------------
 # fast_sam_3dbody_run  executable
 # ---------------------------------------------------------------------------
+option(SAM3D_COREML "Enable the CoreML execution provider (macOS)" ${APPLE})
+if(SAM3D_COREML)
+    target_compile_definitions(fast_sam_3dbody PUBLIC USE_COREML_EP)
+endif()
+
+# macOS: find libonnxruntime.dylib at run time without DYLD_LIBRARY_PATH.
+if(APPLE AND DEFINED ORT_LIB_DIR)
+    set(CMAKE_BUILD_RPATH "${ORT_LIB_DIR}")
+    set(CMAKE_INSTALL_RPATH "${ORT_LIB_DIR}")
+endif()
+
 add_executable(fast_sam_3dbody_run src/core/main.cpp)
 
 target_link_libraries(fast_sam_3dbody_run PRIVATE fast_sam_3dbody)
@@ -414,7 +440,7 @@ target_compile_options(fast_sam_3dbody_run PRIVATE
 # (WGL) equivalent in-tree. Windows builds are headless — the renderer is
 # skipped and a notice is printed instead.
 # ---------------------------------------------------------------------------
-if(NOT WIN32)
+if(NOT WIN32 AND NOT APPLE)
     find_package(OpenGL REQUIRED)
     find_package(GLEW   REQUIRED)
 
@@ -466,9 +492,9 @@ if(NOT WIN32)
 else()
     message(STATUS "")
     message(STATUS "  ┌─────────────────────────────────────────────────────────────────┐")
-    message(STATUS "  │  Windows build: HEADLESS ONLY                                   │")
+    message(STATUS "  │  Windows/macOS build: HEADLESS ONLY                             │")
     message(STATUS "  │                                                                 │")
-    message(STATUS "  │  Live visualization is NOT supported on Windows. The OpenGL     │")
+    message(STATUS "  │  Live visualization is NOT supported here. The OpenGL          │")
     message(STATUS "  │  overlay renderer (fast_sam_3dbody_render) needs GLX/X11 and    │")
     message(STATUS "  │  will not be built.                                             │")
     message(STATUS "  │                                                                 │")
@@ -581,12 +607,18 @@ add_test(NAME core_test COMMAND core_test)
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-if(WIN32)
-    set(_VIS_STATUS "DISABLED (headless build — Windows not supported)")
+if(WIN32 OR APPLE)
+    set(_VIS_STATUS "DISABLED (headless build — Windows/macOS not supported)")
     set(_TARGETS_STATUS "fast_sam_3dbody (lib)  fast_sam_3dbody_run (exe)  offline_sam_3dbody_render (exe)")
 else()
     set(_VIS_STATUS "enabled (fast_sam_3dbody_render)")
     set(_TARGETS_STATUS "fast_sam_3dbody (lib)  fast_sam_3dbody_run (exe)  fast_sam_3dbody_render (exe)  offline_sam_3dbody_render (exe)")
+endif()
+
+if(SAM3D_COREML)
+    set(_COREML_STATUS ON)
+else()
+    set(_COREML_STATUS OFF)
 endif()
 
 message(STATUS "")
@@ -595,6 +627,7 @@ message(STATUS "  Platform      : ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  CUDA support  : ${WITH_CUDA}")
 message(STATUS "  ggml CUDA     : ${GGML_CUDA}")
 message(STATUS "  OpenCV        : ${OpenCV_VERSION}")
+message(STATUS "  CoreML EP     : ${_COREML_STATUS}")
 message(STATUS "  ORT include   : ${ORT_INCLUDE_DIRS}")
 message(STATUS "  Visualization : ${_VIS_STATUS}")
 message(STATUS "  Targets: ${_TARGETS_STATUS}")

@@ -209,6 +209,12 @@ static std::vector<float> cffn_run(const CFFN& ffn, const float* x, int B)
 // severity (see UpdateEnvWithCustomLogLevel() above) is not enough on its own.
 static bool g_ort_verbose = false;
 
+// --coreml / --coreml-units / --ort-threads: set once by Pipeline::Impl::load()
+// before any OrtSession::load(), like g_ort_verbose.
+static bool        g_coreml       = false;
+static std::string g_coreml_units = "ALL";
+static int         g_ort_threads  = 1;
+
 // Set once by Pipeline::Impl::load() when a CUDA allocator has been registered on
 // the Ort::Env, before any OrtSession::load() below.  Each CUDA session otherwise
 // gets its OWN BFC arena, and --refined-pose opens ~30 extra sessions (3 decoder
@@ -371,6 +377,7 @@ struct OrtSession
     // True when the session actually landed on a GPU EP (TensorRT or CUDA) and
     // not on the CPU fallback — i.e. whether binding I/O to device memory works.
     bool                  on_gpu = false;
+    bool                  on_coreml = false;   // CoreML EP: I/O stays in CPU memory (on_gpu stays false)
     // True only when the TensorRT EP actually took the graph.  --pipeline needs
     // this: the TRT EP serialises internally around its execution context, so
     // concurrent Run() on one session is safe, whereas the CUDA EP is not (see
@@ -392,15 +399,18 @@ struct OrtSession
         // than aborting the load.
         //   --trt  →  [TensorRT, CUDA, CPU]
         //   --cuda →  [CUDA, CPU]
+        //   --coreml → [CoreML, CPU]  (macOS; ORT also falls back per-node inside the session)
         //   CPU    →  [CPU]
-        enum EP { EP_TRT, EP_CUDA, EP_CPU };
+        enum EP { EP_TRT, EP_CUDA, EP_COREML, EP_CPU };
         std::vector<EP> ladder;
         if (cuda && trt_ep) ladder.push_back(EP_TRT);
         if (cuda)           ladder.push_back(EP_CUDA);
+        if (g_coreml && !cuda) ladder.push_back(EP_COREML);
         ladder.push_back(EP_CPU);
 
         auto ep_name = [](EP ep) {
-            return ep == EP_TRT ? "TensorRT" : ep == EP_CUDA ? "CUDA" : "CPU";
+            return ep == EP_TRT ? "TensorRT" : ep == EP_CUDA ? "CUDA" :
+                   ep == EP_COREML ? "CoreML" : "CPU";
         };
 
         for (size_t a = 0; a < ladder.size(); ++a)
@@ -408,7 +418,7 @@ struct OrtSession
             const EP ep = ladder[a];
             const bool last = (a + 1 == ladder.size());
             Ort::SessionOptions opts;
-            opts.SetIntraOpNumThreads(1);
+            opts.SetIntraOpNumThreads(g_ort_threads);
             if (fixed_batch > 0)
                 Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(
                                       opts, "B", (int64_t)fixed_batch));
@@ -481,14 +491,38 @@ struct OrtSession
                     if (g_ort_env_allocators)
                         opts.AddConfigEntry("session.use_env_allocators", "1");
                 }
+                else if (ep == EP_COREML)
+                {
+#if defined(USE_COREML_EP)
+                    namespace fs = std::filesystem;
+                    fs::path model_dir = fs::path(path).parent_path();
+                    if (model_dir.empty()) model_dir = ".";
+                    static std::string cache_dir;   // must outlive the Append call below
+                    cache_dir = (model_dir / "coreml_cache").string();
+                    std::error_code ec;
+                    fs::create_directories(cache_dir, ec);
+                    std::unordered_map<std::string, std::string> o{
+                        {"ModelFormat", "MLProgram"},
+                        {"MLComputeUnits", g_coreml_units},
+                        {"RequireStaticInputShapes", "0"},
+                        {"EnableOnSubgraphs", "0"},
+                        {"ModelCacheDirectory", cache_dir}};
+                    opts.AppendExecutionProvider("CoreML", o);
+#else
+                    continue;   // compiled without CoreML EP
+#endif
+                }
                 // EP_CPU: append nothing — the default CPU EP runs.
 
                 session = std::make_unique<Ort::Session>(e, path.c_str(), opts);
                 if (ep == EP_CPU && cuda)
                     fprintf(stderr, "[ORT] WARNING: '%s' running on CPU (GPU EPs unavailable)\n",
                             path.c_str());
-                on_gpu = (ep != EP_CPU);
+                on_coreml = (ep == EP_COREML);
+                on_gpu = (ep == EP_TRT || ep == EP_CUDA);
                 on_trt = (ep == EP_TRT);
+                fprintf(stderr, "[ORT] EP=%s for '%s'%s%s\n", ep_name(ep), path.c_str(),
+                        on_coreml ? " units=" : "", on_coreml ? g_coreml_units.c_str() : "");
                 break;  // success
             }
             catch (const Ort::Exception& ex)
@@ -554,7 +588,7 @@ struct OrtSession
             fprintf(stderr, "[ORT] profile written: %s\n", prof_file.get());
         }
         session.reset();
-        profiling_enabled = on_gpu = on_trt = false;
+        profiling_enabled = on_gpu = on_trt = on_coreml = false;
     }
 };
 
@@ -1185,6 +1219,10 @@ struct Pipeline::Impl
             ort_env.UpdateEnvWithCustomLogLevel(ORT_LOGGING_LEVEL_VERBOSE);
             g_ort_verbose = true;
         }
+
+        g_coreml       = cfg.use_coreml;
+        g_coreml_units = cfg.coreml_units;
+        g_ort_threads  = cfg.ort_threads;
 
         bool cuda = cfg.cuda_device >= 0;
         int  dev  = cfg.cuda_device;

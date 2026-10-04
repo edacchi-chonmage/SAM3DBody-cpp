@@ -42,6 +42,7 @@ struct Config : public CommonConfig
 
     // Runner-specific output
     std::string csv_path;             // -o / --out
+    std::string out2d_path;           // --out2d
 
     // Runner-specific pipeline knobs
     bool        skip_body      = false;
@@ -95,6 +96,9 @@ static void print_usage(const char* prog)
     printf("  --fps Z           Webcam capture framerate  (default: driver default)\n");
     printf("  --cuda DEVICE     CUDA device index (default 0; -1 = CPU)\n");
     printf("  --trt             Enable ONNX Runtime TensorRT EP\n");
+    printf("  --coreml          Use ONNX Runtime CoreML EP (macOS GPU / Neural Engine; implies --cuda -1)\n");
+    printf("  --coreml-units S  CoreML compute units: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly (default ALL)\n");
+    printf("  --ort-threads N   ORT intra-op threads per session (default 1; 0 = all cores)\n");
     printf("  --no-fp16         Disable FP16 for ONNX EP\n");
     printf("  --ort-verbose     Print ORT's per-node EP assignment + a chrome-trace profile per\n");
     printf("                    session to /tmp/ort_profile_<model>_*.json (open in chrome://tracing)\n");
@@ -113,6 +117,7 @@ static void print_usage(const char* prog)
     printf("  --cy F            Principal point y (0 = height/2)\n");
     printf("  --render-size W H GL window width and height in pixels (default: match input)\n");
     printf("  -o / --out PATH   Write 3D keypoints to CSV (frame,skeleton_id,joint_x,y,z...)\n");
+    printf("  --out2d PATH      Write 2D keypoints + bbox (pixels) to CSV (frame,skeleton_id,bbox_*,<name>_u,v...)\n");
     printf("  --bvh PATH        Write BVH motion capture output to PATH (one file per tracked person)\n");
     printf("  --bvh-template P  BVH skeleton template (default ./bvh/body_mhr.bvh; ./bvh/mocapnet.bvh for MakeHuman; ./bvh/mixamo.bvh for Mixamo; ./bvh/lafan.bvh for LAFAN1/GMR)\n");
     printf("  --no-bvh-body-shape-change  Keep the template's authored body bone lengths (no median rewrite)\n");
@@ -156,6 +161,7 @@ static Config parse_args(int argc, char** argv)
         ARG1("--cy",       cy,          std::stof)
         ARG1("--out",      csv_path,    std::string)
         ARG1("-o",         csv_path,    std::string)
+        ARG1("--out2d",    out2d_path,  std::string)
 #undef ARG1
         if (!strcmp(argv[i], "--render-size") && i+2 < argc)
         {
@@ -440,6 +446,28 @@ static void write_csv_rows(std::ofstream& f, int frame_no,
     }
 }
 
+static void write_csv2d_header(std::ofstream& f)
+{
+    f << "frame,skeleton_id,bbox_x1,bbox_y1,bbox_x2,bbox_y2";
+    for (int j = 0; j < 70; ++j)
+        f << "," << KP_NAMES[j] << "_u," << KP_NAMES[j] << "_v";
+    f << "\n";
+}
+
+static void write_csv2d_rows(std::ofstream& f, int frame_no,
+                             const std::vector<fsb::MHRResult>& results)
+{
+    for (int i = 0; i < (int)results.size(); ++i)
+    {
+        const auto& r = results[i];
+        if (r.keypoints_2d.size() < 70*2) continue;
+        f << frame_no << "," << i;
+        for (float v : r.bbox) f << "," << v;
+        for (int j = 0; j < 70*2; ++j) f << "," << r.keypoints_2d[j];
+        f << "\n";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -485,6 +513,19 @@ int main(int argc, char** argv)
         }
         write_csv_header(csv_out);
         printf("[main] Writing 3D keypoints to: %s\n", c.csv_path.c_str());
+    }
+
+    std::ofstream csv2d_out;
+    if (!c.out2d_path.empty())
+    {
+        csv2d_out.open(c.out2d_path);
+        if (!csv2d_out)
+        {
+            fprintf(stderr, "[main] Cannot open 2D CSV for writing: %s\n", c.out2d_path.c_str());
+            return 1;
+        }
+        write_csv2d_header(csv2d_out);
+        printf("[main] Writing 2D keypoints to: %s\n", c.out2d_path.c_str());
     }
 
     // -----------------------------------------------------------------------
@@ -861,6 +902,8 @@ int main(int argc, char** argv)
         // CSV
         if (csv_out.is_open())
             write_csv_rows(csv_out, frame_count, results);
+        if (csv2d_out.is_open())
+            write_csv2d_rows(csv2d_out, frame_count, results);
 
         // BVH (buffered, one file per person at close) — only when --bvh is set.
         if (bvh_writer.is_open() && !c.bvh_path.empty())

@@ -27,8 +27,12 @@ add_test(NAME calib_test
 # instead of failing the whole build (mirrors the optional synchronization /
 # AmmarServer features).
 # ---------------------------------------------------------------------------
-find_package(OpenCV QUIET COMPONENTS aruco)
-if(OpenCV_aruco_FOUND OR TARGET opencv_aruco)
+# macOS (Homebrew) ships OpenCV >= 4.7 whose aruco API (Dictionary/DetectorParameters)
+# no longer matches aruco_qr.cpp, so the ArUco/QR tools are skipped there.
+if(NOT APPLE)
+    find_package(OpenCV QUIET COMPONENTS aruco)
+endif()
+if(NOT APPLE AND (OpenCV_aruco_FOUND OR TARGET opencv_aruco))
     set(MULTIVIEW_HAVE_ARUCO TRUE)
 endif()
 
