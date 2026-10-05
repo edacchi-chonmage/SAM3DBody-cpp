@@ -3,7 +3,7 @@
 
 Usage: bvh_compare_video.py VIDEO BVH -o OUT.mp4 [--width 1280] [--crf 26]
 Panels use a fixed span for the whole clip and follow the root horizontally;
-the ground line stays at the clip-wide minimum height.
+the ground line follows a 1 s running median of the lowest joint.
 """
 import argparse
 import os
@@ -39,7 +39,12 @@ def main():
     pk = poses[:, keep]
     body = (pk[:, :, 1].max(1) - pk[:, :, 1].min(1))
     span = max(body.max(), 120) * 1.3
-    ground = pk[:, :, 1].min()
+    # Ground follows a 1 s running median of the lowest joint, so a skater who rides
+    # toward the camera (root height drifts with depth) stays framed, while jumps
+    # shorter than that still lift the figure off the line.
+    low = pk[:, :, 1].min(1)
+    k = max(1, int(round(0.5 / ft)))
+    ground = np.array([np.median(low[max(0, i - k):i + k + 1]) for i in range(len(low))])
 
     cap = cv2.VideoCapture(a.video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -51,8 +56,8 @@ def main():
     s = (H - 20) / span
     gy = int(H * 0.9)
 
-    def px(p, hax, rootx):
-        return int(H / 2 + (p[hax] - rootx) * s), int(gy - (p[1] - ground) * s)
+    def px(p, hax, rootx, g):
+        return int(H / 2 + (p[hax] - rootx) * s), int(gy - (p[1] - g) * s)
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     ff = subprocess.Popen(
@@ -77,7 +82,7 @@ def main():
             cv2.line(img, (0, gy), (H, gy), (170, 170, 170), 1)
             for u, w in edges:
                 col = (0, 0, 200) if "r" == names[w][0] and names[w] != "rCollar" and "Foot" in names[w] + names[u] else (60, 60, 60)
-                cv2.line(img, px(p[u], hax, p[0][hax]), px(p[w], hax, p[0][hax]), col, 2, cv2.LINE_AA)
+                cv2.line(img, px(p[u], hax, p[0][hax], ground[bf]), px(p[w], hax, p[0][hax], ground[bf]), col, 2, cv2.LINE_AA)
             cv2.putText(img, v, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
             panels.append(img)
         ff.stdin.write(np.hstack(panels).tobytes())
