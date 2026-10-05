@@ -80,6 +80,9 @@ def main():
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--times", default="1,4,7,10,13,16,19")
     ap.add_argument("--views", default="front,side")
+    ap.add_argument("--follow", action="store_true",
+                    help="centre each panel on that frame's root and zoom to the body (pose check); "
+                         "default keeps whole-clip limits so travel is visible")
     a = ap.parse_args()
     times = [float(x) for x in a.times.split(",")]
     views = a.views.split(",")
@@ -103,9 +106,12 @@ def main():
     cen = (lo + hi) / 2
     pad = 0.05 * span
     # y is the same scale in both views; horizontal axis is centred on the clip
-    def to_px(p, hax):
-        s = (H - 20) / span
-        return int(H / 2 + (p[hax] - cen[hax]) * s), int(H / 2 - (p[1] - cen[1]) * s)
+    body = (hi[1] - lo[1]) if not a.follow else 0
+    def to_px(p, hax, c=None, sp=None):
+        c = cen if c is None else c
+        sp = span if sp is None else sp
+        s = (H - 20) / sp
+        return int(H / 2 + (p[hax] - c[hax]) * s), int(H / 2 - (p[1] - c[1]) * s)
 
     cap = cv2.VideoCapture(a.video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -117,15 +123,21 @@ def main():
         fr = cv2.resize(fr, (int(fr.shape[1] * H / fr.shape[0]), H))
         bf = min(max(int(round(t / ft)), 0), len(data) - 1)
         p = fk(names, parent, offs, chans, data[bf])
+        c, sp, gnd = None, None, ground
+        if a.follow:
+            pk = p[keep]
+            c = (pk.min(0) + pk.max(0)) / 2
+            sp = max(pk.max(0)[1] - pk.min(0)[1], 120) * 1.3
+            gnd = pk.min(0)[1]
         panels = [fr]
         for v in views:
             hax = 0 if v == "front" else 2
             img = np.full((H, H, 3), 255, np.uint8)
-            gy = to_px(np.array([0, ground, 0]), 0)[1]
+            gy = to_px(np.array([0, gnd, 0]), 0, c, sp)[1]
             cv2.line(img, (0, gy), (H, gy), (170, 170, 170), 1)
             for u, w in edges:
                 col = (0, 0, 200) if "r" == names[w][0] and names[w] != "rCollar" and "Foot" in names[w] + names[u] else (60, 60, 60)
-                cv2.line(img, to_px(p[u], hax), to_px(p[w], hax), col, 2, cv2.LINE_AA)
+                cv2.line(img, to_px(p[u], hax, c, sp), to_px(p[w], hax, c, sp), col, 2, cv2.LINE_AA)
             cv2.putText(img, v, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
             panels.append(img)
         row = np.hstack(panels)

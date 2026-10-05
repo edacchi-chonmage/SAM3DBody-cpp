@@ -113,6 +113,95 @@ Once they are in `onnx/`, `--cuda -1` picks both up by itself — no extra flags
 
 > **CMake will warn** at configure time if neither `onnx/` nor the zip is found.
 
+### macOS (Apple Silicon)
+
+Tested on a MacBook Pro M5 Pro, macOS 26.5, ONNX Runtime 1.30.0.  There is no
+CUDA on a Mac; the heavy graphs (backbone, decoder, YOLO) run on the Apple GPU
+through ONNX Runtime's **CoreML execution provider**.  Everything else (body
+model, `--refined-pose` decoder graphs) stays on the CPU EP.  The live OpenGL
+renderer (`fast_sam_3dbody_render`, GLX/X11) is not built on macOS; the CLI
+(`fast_sam_3dbody_run`) and the offline BVH extractor
+(`offline_sam_3dbody_render`, `scripts/offline_video.sh`) are.
+
+**1. Dependencies**
+
+```bash
+brew install cmake opencv@4 coreutils
+# official ORT release (includes the CoreML EP); CMake also downloads it by itself
+# when -DONNX_RUNTIME_DIR is not given
+curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-osx-arm64-1.30.0.tgz
+tar xzf onnxruntime-osx-arm64-1.30.0.tgz
+```
+
+`opencv@4` rather than `opencv` (5.x): the multiview tools need `calib3d`.
+
+**2. Build**
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DONNX_RUNTIME_DIR=$PWD/onnxruntime-osx-arm64-1.30.0 \
+      -DOpenCV_DIR=/opt/homebrew/opt/opencv@4/lib/cmake/opencv4
+cmake --build build -j
+```
+
+The configure summary prints `CoreML EP : ON` (option `SAM3D_COREML`, on by
+default on Apple).
+
+**3. Models**
+
+```bash
+bash tools/fetch_model.sh shared cpu trt refined --yes   # fp32/fp16 models + refined-pose graphs
+python3 -m pip install onnx onnxruntime==1.30.0 numpy
+python3 tools/prepare_coreml_models.py --check           # writes onnx/backbone_coreml.onnx, decoder_coreml.onnx
+```
+
+`prepare_coreml_models.py` is required for usable CoreML speed.  It works around
+two problems found with the stock exports:
+
+* the backbone uses `Neg` (RoPE), which the CoreML EP does not support, so the
+  graph was cut into 33 CoreML/CPU pieces — rewritten as `Mul(x, -1)`;
+* ORT's `MatMulAddFusion` turns MatMul+Add into Gemm, and the CoreML EP stores
+  transposed Gemm weights *inline* in the MIL program (9.5 GB of text for the
+  backbone; compilation did not finish in 30 min).  The script pre-optimizes the
+  graph offline with that fusion disabled and the batch fixed to 1; the C++ side
+  loads every `*_coreml.onnx` with ORT optimizations off and runs batch > 1
+  sample by sample.
+
+Result: the backbone is a single CoreML partition, compiled once (~25 s, cached
+in `onnx/coreml_cache/`).
+
+**4. Run**
+
+```bash
+# any binary: --coreml picks *_coreml.onnx and the CoreML EP
+build/fast_sam_3dbody_run --from clip.mp4 --coreml --ort-threads 0 --headless --out kp.csv
+scripts/offline_video.sh --from clip.mp4 --bvh out.bvh --smoothing zero-phase --coreml --ort-threads 0
+```
+
+Every session prints the EP it landed on, e.g.
+`[ORT] EP=CoreML for './onnx/backbone_coreml.onnx' units=CPUAndGPU`.
+
+| flag | meaning |
+|------|---------|
+| `--coreml` | CoreML EP for backbone / decoder / YOLO (implies `--cuda -1`) |
+| `--coreml-units S` | `CPUAndGPU` (default), `ALL`, `CPUAndNeuralEngine`, `CPUOnly`.  `ALL` / Neural Engine: Apple's ANE compiler fails on the ViT-H backbone and falls back: measured 2.5–15× slower with `ALL`, ~100× with `CPUAndNeuralEngine` |
+| `--ort-threads N` | ORT intra-op threads per session (default 1 as upstream; `0` = all cores — use it on a Mac, the CPU-side graphs need it) |
+
+Measured on the M5 Pro (frames 2–11 from t=5 s of a 1920×1080 skate clip,
+`fast_sam_3dbody_run`, average per frame):
+
+| path | s / frame |
+|------|-----------|
+| CPU EP only, fp32 backbone, 1 thread (upstream default) | 2.90 |
+| CPU EP only, fp32 backbone, `--ort-threads 0` | 1.16 – 1.70 (varies with other load) |
+| `--coreml` (CPUAndGPU) | 0.153 – 0.164 |
+
+3D joints differ by at most 0.12 mm (mean 0.045 mm) and 2D keypoints by at most
+0.04 px between the CPU-only and CoreML runs.  The offline extractor with its
+default `--refined-pose` takes ~1.1 s/frame on an idle machine (20 s / 1200
+frames in 23 min): the refined decoder graphs stay on the CPU and every hand
+crop is another backbone pass.
+
 ---
 
 ## Pipeline
