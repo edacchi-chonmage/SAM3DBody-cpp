@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Video | BVH front | BVH side, one output frame per video frame, written as mp4.
 
-Usage: bvh_compare_video.py VIDEO BVH -o OUT.mp4 [--width 1280] [--crf 26]
+Usage: bvh_compare_video.py VIDEO BVH -o OUT.mp4 [--width 1280] [--crf 26] [--board-2d CSV]
+If the BVH has a 'board' root, its 80x21 cm deck top (blue) and deck normal (green) are drawn
+in the front/side panels. --board-2d CSV (frame,u1,v1..u4,v4, full-res px) draws a blue
+quadrilateral on the video panel.
 Panels use a fixed span for the whole clip and follow the root horizontally;
 the ground line follows a 1 s running median of the lowest joint.
 """
 import argparse
+import csv
 import os
 import subprocess
 import sys
@@ -23,12 +27,18 @@ def main():
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--crf", type=int, default=26)
+    ap.add_argument("--board-2d")
     a = ap.parse_args()
 
     names, parent, offs, chans, data, ft = bss.parse_bvh(a.bvh)
     keep = [bool(n) and not n.startswith("__") and not any(s in n.lower() for s in bss.SKIP)
             for n in names]
     keep[0] = True
+    bi = names.index("board") if "board" in names else -1
+    if bi >= 0:
+        keep[bi] = False
+        bn = len(names)
+        for j in range(bi, bn): keep[j] = False
     anc = []
     for j, p in enumerate(parent):
         while p >= 0 and not keep[p]: p = parent[p]
@@ -36,6 +46,15 @@ def main():
     edges = [(anc[j], j) for j in range(len(names)) if keep[j] and anc[j] >= 0]
 
     poses = np.array([bss.fk(names, parent, offs, chans, r) for r in data])
+    quads = {}
+    if a.board_2d:
+        for r in csv.DictReader(open(a.board_2d)):
+            quads[int(r["frame"])] = np.array([[float(r[f"u{i}"]), float(r[f"v{i}"])] for i in range(1, 5)])
+    if bi >= 0:
+        # board rotation matrices per frame (channel order Z Y X, after the 3 position channels)
+        k0 = sum(len(c) for c in chans[:bi]) + 3
+        bR = [bss.rot("Z", r[k0]) @ bss.rot("Y", r[k0 + 1]) @ bss.rot("X", r[k0 + 2]) for r in data]
+        corners = np.array([[40, 0, -10.5], [40, 0, 10.5], [-40, 0, 10.5], [-40, 0, -10.5]], float)
     pk = poses[:, keep]
     body = (pk[:, :, 1].max(1) - pk[:, :, 1].min(1))
     span = max(body.max(), 120) * 1.3
@@ -75,6 +94,9 @@ def main():
         vid = cv2.resize(fr, (VW, H), interpolation=cv2.INTER_AREA)
         cv2.putText(vid, f"t={t:.2f}s  bvh#{bf}", (8, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (0, 255, 255), 1, cv2.LINE_AA)
+        if bf in quads:
+            q = (quads[bf] * [VW / vw, H / vh]).astype(np.int32)
+            cv2.polylines(vid, [q], True, (255, 0, 0), 2, cv2.LINE_AA)
         panels = [vid]
         for v in ("front", "side"):
             hax = 0 if v == "front" else 2
@@ -83,6 +105,12 @@ def main():
             for u, w in edges:
                 col = (0, 0, 200) if "r" == names[w][0] and names[w] != "rCollar" and "Foot" in names[w] + names[u] else (60, 60, 60)
                 cv2.line(img, px(p[u], hax, p[0][hax], ground[bf]), px(p[w], hax, p[0][hax], ground[bf]), col, 2, cv2.LINE_AA)
+            if bi >= 0:
+                c0 = poses[bf][bi]
+                q = np.array([px(c0 + bR[bf] @ c, hax, p[0][hax], ground[bf]) for c in corners], np.int32)
+                cv2.polylines(img, [q], True, (255, 0, 0), 3, cv2.LINE_AA)
+                cv2.line(img, px(c0, hax, p[0][hax], ground[bf]),
+                         px(c0 + bR[bf] @ [0, 15, 0], hax, p[0][hax], ground[bf]), (0, 170, 0), 3, cv2.LINE_AA)
             cv2.putText(img, v, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
             panels.append(img)
         ff.stdin.write(np.hstack(panels).tobytes())
