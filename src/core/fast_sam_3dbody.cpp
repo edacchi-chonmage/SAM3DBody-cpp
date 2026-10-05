@@ -383,6 +383,8 @@ struct OrtSession
     // concurrent Run() on one session is safe, whereas the CUDA EP is not (see
     // pipeline_start()).
     bool                  on_trt = false;
+    // *_coreml.onnx has its batch dim pre-fixed to 1; run() splits larger batches.
+    bool                  batch1_only = false;
 
     // fixed_batch > 0 pins the model's symbolic "B" dimension to that value.  ORT
     // can then constant-fold the shape arithmetic that a dynamic batch forces it
@@ -427,6 +429,7 @@ struct OrtSession
             // MatMulAddFusion would turn MatMul into Gemm and the CoreML EP then inlines the
             // transposed weights into the MIL program, so compile would never finish.
             const bool preopt = path.size() >= 12 && path.compare(path.size() - 12, 12, "_coreml.onnx") == 0;
+            batch1_only = preopt;
             opts.SetGraphOptimizationLevel(preopt ? GraphOptimizationLevel::ORT_DISABLE_ALL
                                                   : GraphOptimizationLevel::ORT_ENABLE_ALL);
             if (g_ort_verbose)
@@ -594,7 +597,55 @@ struct OrtSession
             fprintf(stderr, "[ORT] profile written: %s\n", prof_file.get());
         }
         session.reset();
-        profiling_enabled = on_gpu = on_trt = on_coreml = false;
+        profiling_enabled = on_gpu = on_trt = on_coreml = batch1_only = false;
+    }
+
+    // Run(); for batch1_only models with batch > 1, run sample by sample and
+    // stitch the float outputs back into [B, ...] tensors.
+    std::vector<Ort::Value> run(const Ort::Value* inputs, size_t n_in, size_t n_out)
+    {
+        auto run_all = [&](const Ort::Value* in) {
+            return session->Run(Ort::RunOptions{nullptr}, input_names.data(), in, n_in,
+                                output_names.data(), n_out);
+        };
+        const int64_t B = inputs[0].GetTensorTypeAndShapeInfo().GetShape()[0];
+        if (!batch1_only || B <= 1) return run_all(inputs);
+
+        Ort::MemoryInfo cpu = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::AllocatorWithDefaultOptions alloc;
+        std::vector<Ort::Value> result;
+        for (int64_t b = 0; b < B; ++b)
+        {
+            std::vector<Ort::Value> in_b;
+            for (size_t i = 0; i < n_in; ++i)
+            {
+                auto info = inputs[i].GetTensorTypeAndShapeInfo();
+                if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+                    throw std::runtime_error("OrtSession::run: non-float32 input " + std::to_string(i));
+                auto shp = info.GetShape();
+                size_t per = info.GetElementCount() / (size_t)shp[0];
+                shp[0] = 1;
+                float* p = const_cast<float*>(inputs[i].GetTensorData<float>()) + (size_t)b * per;
+                in_b.push_back(Ort::Value::CreateTensor<float>(cpu, p, per, shp.data(), shp.size()));
+            }
+            auto out_b = run_all(in_b.data());
+            for (size_t o = 0; o < n_out; ++o)
+            {
+                auto info = out_b[o].GetTensorTypeAndShapeInfo();
+                if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+                    throw std::runtime_error("OrtSession::run: non-float32 output " + std::to_string(o));
+                auto shp = info.GetShape();
+                size_t per = info.GetElementCount();
+                if (b == 0)
+                {
+                    shp[0] = B;
+                    result.push_back(Ort::Value::CreateTensor<float>(alloc, shp.data(), shp.size()));
+                }
+                std::memcpy(result[o].GetTensorMutableData<float>() + (size_t)b * per,
+                            out_b[o].GetTensorData<float>(), per * sizeof(float));
+            }
+        }
+        return result;
     }
 };
 
@@ -2108,10 +2159,7 @@ struct Pipeline::Impl
 
         Ort::Value img_t = Ort::Value::CreateTensor<float>(
                                mi, batch_crops.data(), batch_crops.size(), img_shape.data(), 4);
-        ctx.backbone_out = sess_backbone.session->Run(
-                                Ort::RunOptions{nullptr},
-                                sess_backbone.input_names.data(),  &img_t,  1,
-                                sess_backbone.output_names.data(), 1);
+        ctx.backbone_out = sess_backbone.run(&img_t, 1, 1);
         // backbone_out owns this buffer and stays in scope for the whole frame
         // (pass 1 at the decoder below, pass 2 further down), so point at it
         // directly rather than memcpy'ing 5.2 MB per person into a vector.
@@ -2256,13 +2304,7 @@ struct Pipeline::Impl
             dec_inputs.push_back(std::move(cond_t));
             dec_inputs.push_back(std::move(ray_t));
 
-            std::vector<const char*>& dec_in_names  = sess_decoder.input_names;
-            std::vector<const char*>& dec_out_names = sess_decoder.output_names;
-
-            auto decoder_out = sess_decoder.session->Run(
-                                   Ort::RunOptions{nullptr},
-                                   dec_in_names.data(),  dec_inputs.data(),  dec_inputs.size(),
-                                   dec_out_names.data(), 1);
+            auto decoder_out = sess_decoder.run(dec_inputs.data(), dec_inputs.size(), 1);
             std::memcpy(pose_tokens.data(), decoder_out[0].GetTensorData<float>(), token_elems*sizeof(float));
             double dt_dec = ms(t0);
             add_time(timers.decoder, dt_dec);
@@ -2457,10 +2499,7 @@ struct Pipeline::Impl
 
             Ort::Value hfeat_in_t = Ort::Value::CreateTensor<float>(
                                         mi, hbatch_crops.data(), hbatch_crops.size(), himg_shape.data(), 4);
-            auto hand_backbone_out = sess_backbone.session->Run(
-                                         Ort::RunOptions{nullptr},
-                                         sess_backbone.input_names.data(),  &hfeat_in_t, 1,
-                                         sess_backbone.output_names.data(), 1);
+            auto hand_backbone_out = sess_backbone.run(&hfeat_in_t, 1, 1);
             // As above: hand_backbone_out owns the buffer and outlives every use.
             float* hand_features = hand_backbone_out[0].GetTensorMutableData<float>();
             // DIAGNOSTIC: dump hand-crop backbone features per side (C,FEAT_HW,FEAT_HW
@@ -3825,10 +3864,7 @@ struct Pipeline::Impl
         std::vector<int64_t> img_shape{1, 3, CROP_SIZE, CROP_SIZE};
         Ort::Value img_t = Ort::Value::CreateTensor<float>(
                                mi, chw.data(), chw.size(), img_shape.data(), 4);
-        auto out = sess_backbone.session->Run(
-                       Ort::RunOptions{nullptr},
-                       sess_backbone.input_names.data(),  &img_t,  1,
-                       sess_backbone.output_names.data(), 1);
+        auto out = sess_backbone.run(&img_t, 1, 1);
         const float* feat = out[0].GetTensorData<float>();   // [1,1280,32,32]
 
         // Global-average-pool over the spatial grid → 1280-d, then L2-normalise.
