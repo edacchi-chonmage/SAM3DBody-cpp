@@ -212,7 +212,7 @@ static bool g_ort_verbose = false;
 // --coreml / --coreml-units / --ort-threads: set once by Pipeline::Impl::load()
 // before any OrtSession::load(), like g_ort_verbose.
 static bool        g_coreml       = false;
-static std::string g_coreml_units = "ALL";
+static std::string g_coreml_units = "CPUAndGPU";
 static int         g_ort_threads  = 1;
 
 // Set once by Pipeline::Impl::load() when a CUDA allocator has been registered on
@@ -391,7 +391,8 @@ struct OrtSession
     // really is always called at that batch size: ORT rejects other shapes after
     // the override.
     bool load(Ort::Env& e, const std::string& path, bool cuda, int device,
-              bool fp16_io = false, bool trt_ep = false, int fixed_batch = 0)
+              bool fp16_io = false, bool trt_ep = false, int fixed_batch = 0,
+              bool allow_coreml = false)
     {
         // Execution-provider preference ladder, most→least preferred.  We try
         // each in turn and fall back on failure, so a missing TensorRT runtime
@@ -405,7 +406,7 @@ struct OrtSession
         std::vector<EP> ladder;
         if (cuda && trt_ep) ladder.push_back(EP_TRT);
         if (cuda)           ladder.push_back(EP_CUDA);
-        if (g_coreml && !cuda) ladder.push_back(EP_COREML);
+        if (g_coreml && allow_coreml && !cuda) ladder.push_back(EP_COREML);
         ladder.push_back(EP_CPU);
 
         auto ep_name = [](EP ep) {
@@ -422,7 +423,12 @@ struct OrtSession
             if (fixed_batch > 0)
                 Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(
                                       opts, "B", (int64_t)fixed_batch));
-            opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            // *_coreml.onnx was already optimized offline (tools/prepare_coreml_models.py); ORT's
+            // MatMulAddFusion would turn MatMul into Gemm and the CoreML EP then inlines the
+            // transposed weights into the MIL program, so compile would never finish.
+            const bool preopt = path.size() >= 12 && path.compare(path.size() - 12, 12, "_coreml.onnx") == 0;
+            opts.SetGraphOptimizationLevel(preopt ? GraphOptimizationLevel::ORT_DISABLE_ALL
+                                                  : GraphOptimizationLevel::ORT_ENABLE_ALL);
             if (g_ort_verbose)
             {
                 opts.SetLogSeverityLevel(ORT_LOGGING_LEVEL_VERBOSE);
@@ -1257,14 +1263,14 @@ struct Pipeline::Impl
         printf("[FSB] Loading backbone … ");
         fflush(stdout);
         if (!sess_backbone.load(ort_env, opath(cfg.backbone_name.c_str()), cuda, dev,
-                                cfg.use_fp16, cfg.use_trt_ep))
+                                cfg.use_fp16, cfg.use_trt_ep, 0, true))
             return false;
         printf("OK\n");
 
         printf("[FSB] Loading decoder  … ");
         fflush(stdout);
         if (!sess_decoder.load(ort_env, opath(cfg.decoder_name.c_str()), cuda, dev,
-                               cfg.use_fp16, cfg.use_trt_ep))
+                               cfg.use_fp16, cfg.use_trt_ep, 0, true))
             return false;
         printf("OK\n");
 
@@ -1479,7 +1485,7 @@ struct Pipeline::Impl
         {
             printf("[FSB] Loading YOLO … ");
             fflush(stdout);
-            if (!sess_yolo.load(ort_env, cfg.yolo_path, cuda, dev, false, cfg.use_trt_ep))
+            if (!sess_yolo.load(ort_env, cfg.yolo_path, cuda, dev, false, cfg.use_trt_ep, 0, true))
             {
                 fprintf(stderr, "[FSB] YOLO load failed – detection disabled\n");
             }

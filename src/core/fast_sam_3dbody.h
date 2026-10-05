@@ -115,7 +115,7 @@ struct PipelineConfig {
     int  cuda_device    = 0;        // CUDA device (-1 = CPU only)
     bool use_trt_ep     = false;    // Enable ONNX Runtime TensorRT EP (requires TRT install)
     bool use_coreml     = false;    // --coreml: ONNX Runtime CoreML EP (macOS)
-    std::string coreml_units = "ALL"; // CoreML MLComputeUnits: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly
+    std::string coreml_units = "CPUAndGPU"; // CoreML MLComputeUnits: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly
     int  ort_threads    = 1;        // ORT intra-op threads per session (0 = ORT default = all cores)
     bool use_fp16       = true;     // FP16 for ONNX EP
     // Raise the ORT Env's log severity to VERBOSE (--ort-verbose). Prints the

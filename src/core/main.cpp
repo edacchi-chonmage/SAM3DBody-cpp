@@ -97,7 +97,7 @@ static void print_usage(const char* prog)
     printf("  --cuda DEVICE     CUDA device index (default 0; -1 = CPU)\n");
     printf("  --trt             Enable ONNX Runtime TensorRT EP\n");
     printf("  --coreml          Use ONNX Runtime CoreML EP (macOS GPU / Neural Engine; implies --cuda -1)\n");
-    printf("  --coreml-units S  CoreML compute units: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly (default ALL)\n");
+    printf("  --coreml-units S  CoreML compute units: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly (default CPUAndGPU; ALL also tries the Neural Engine, which fails to compile the backbone)\n");
     printf("  --ort-threads N   ORT intra-op threads per session (default 1; 0 = all cores)\n");
     printf("  --no-fp16         Disable FP16 for ONNX EP\n");
     printf("  --ort-verbose     Print ORT's per-node EP assignment + a chrome-trace profile per\n");

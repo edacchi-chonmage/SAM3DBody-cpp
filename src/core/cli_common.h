@@ -87,7 +87,7 @@ struct CommonConfig
     int         cuda_device    = 0;       // -1 = CPU
     bool        use_trt        = false;
     bool        use_coreml     = false;   // ONNX Runtime CoreML EP (macOS)
-    std::string coreml_units   = "ALL";
+    std::string coreml_units   = "CPUAndGPU";
     int         ort_threads    = 1;
     bool        fp16           = true;    // can be disabled with --no-fp16
     bool        ort_verbose    = false;   // --ort-verbose: print per-node EP assignment at session load
@@ -669,6 +669,25 @@ inline void resolve_backbone_defaults(CommonConfig& c)
                     c.onnx_dir.c_str());
             }
         }
+        if (c.use_coreml) {
+            bool missing = false;
+            if (!c.backbone_name_set) {
+                if (exists("backbone_coreml.onnx")) {
+                    c.backbone_name = "backbone_coreml.onnx";
+                    std::fprintf(stderr, "[cli] CoreML: using 'backbone_coreml.onnx' (pre-optimized for the CoreML EP).\n");
+                } else missing = true;
+            }
+            if (c.decoder_name == "decoder.onnx" || c.decoder_name == "decoder_fp16.onnx") {
+                if (exists("decoder_coreml.onnx")) {
+                    c.decoder_name = "decoder_coreml.onnx";
+                    std::fprintf(stderr, "[cli] CoreML: using 'decoder_coreml.onnx' (pre-optimized for the CoreML EP).\n");
+                } else missing = true;
+            }
+            if (missing)
+                std::fprintf(stderr,
+                    "[cli] CoreML: *_coreml.onnx models are missing; keeping the CPU models (CoreML will be slow/fragmented).\n"
+                    "      run: python3 tools/prepare_coreml_models.py\n");
+        }
         return;   // the TRT / fp16-backbone swaps below are CUDA-only
     }
 
@@ -771,7 +790,7 @@ inline void print_common_args_help(FILE* fp)
         "  --cuda     N                   CUDA device (-1 = CPU; default 0)\n"
         "  --trt                          Use ONNX Runtime TensorRT EP\n"
         "  --coreml                       Use ONNX Runtime CoreML EP (macOS Apple GPU / Neural Engine; implies --cuda -1)\n"
-        "  --coreml-units S               CoreML compute units: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly (default ALL)\n"
+        "  --coreml-units S               CoreML compute units: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly (default CPUAndGPU; ALL also tries the Neural Engine, which fails to compile the backbone)\n"
         "  --ort-threads N                ORT intra-op threads per session (default 1; 0 = all cores)\n"
         "  --no-fp16                      Disable FP16\n"
         "  --pipeline N                   Process N frames concurrently on a worker pool (default 1).\n"

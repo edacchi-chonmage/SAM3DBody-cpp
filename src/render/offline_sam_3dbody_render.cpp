@@ -104,7 +104,7 @@ static void print_usage(const char* prog)
         "  --cuda     N               CUDA device index, -1 for CPU (default 0)\n"
         "  --trt                      Use ONNX Runtime TensorRT EP\n"
         "  --coreml                   Use ONNX Runtime CoreML EP (macOS GPU / Neural Engine; implies --cuda -1)\n"
-        "  --coreml-units S           CoreML compute units: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly (default ALL)\n"
+        "  --coreml-units S           CoreML compute units: ALL | CPUAndGPU | CPUAndNeuralEngine | CPUOnly (default CPUAndGPU; ALL also tries the Neural Engine, which fails to compile the backbone)\n"
         "  --ort-threads N            ORT intra-op threads per session (default 1; 0 = all cores)\n"
         "  --no-fp16                  Disable FP16\n"
         "  --no-refined-pose          Disable the iterative refined pose, which is ON by default in\n"
