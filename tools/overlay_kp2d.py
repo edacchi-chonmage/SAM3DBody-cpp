@@ -49,6 +49,9 @@ def main():
     ap.add_argument("video")
     ap.add_argument("csv")
     ap.add_argument("--frame", type=int, default=0)
+    ap.add_argument("--csv-frame", type=int, help="CSV 'frame' value to draw (default: --frame; "
+                    "fast_sam_3dbody_run numbers frames from 1, so video frame 0 is CSV frame 1)")
+    ap.add_argument("--zoom", action="store_true", help="append an enlarged crop around the first bbox")
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--csv2")
     ap.add_argument("--label1", default="csv1")
@@ -64,13 +67,16 @@ def main():
     sets = [(a.csv, a.label1, (0, 255, 0))]  # BGR: green
     if a.csv2:
         sets.append((a.csv2, a.label2, (0, 0, 255)))  # red
+    csv_frame = a.frame if a.csv_frame is None else a.csv_frame
     caption = f"frame {a.frame}"
+    zoom_box = None
     for path, label, color in sets:
-        data = load(path, a.frame)
+        data = load(path, csv_frame)
         if data is None:
-            print(f"warning: frame {a.frame} not in {path}")
+            print(f"warning: frame {csv_frame} not in {path}")
             continue
         draw(img, data, color)
+        zoom_box = zoom_box or data[0]
     if a.csv2:
         caption += f"  {a.label1} (green) vs {a.label2} (red)"
     else:
@@ -83,9 +89,19 @@ def main():
             cv2.circle(img, (25, y - 8), 10, color, -1)
             cv2.putText(img, label, (45, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
 
+    if a.zoom and zoom_box is not None:
+        x1, y1, x2, y2 = zoom_box
+        m = 0.25 * max(x2 - x1, y2 - y1)
+        H, W = img.shape[:2]
+        x1, y1 = max(0, int(x1 - m)), max(0, int(y1 - m))
+        x2, y2 = min(W, int(x2 + m)), min(H, int(y2 + m))
+        crop = img[y1:y2, x1:x2]
+        crop = cv2.resize(crop, (round(crop.shape[1] * H / crop.shape[0]), H), interpolation=cv2.INTER_CUBIC)
+        img = cv2.hconcat([img, crop])
+
     h, w = img.shape[:2]
-    if w > 1280:
-        img = cv2.resize(img, (1280, round(h * 1280 / w)), interpolation=cv2.INTER_AREA)
+    if w > 1600:
+        img = cv2.resize(img, (1600, round(h * 1600 / w)), interpolation=cv2.INTER_AREA)
     cv2.imwrite(a.out, img, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
 
